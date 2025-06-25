@@ -1,5 +1,6 @@
 # ROSiK  
 **Robot Operating System — interactive Kit**  
+![my_scheme](https://github.com/user-attachments/assets/68496d76-b3b0-4ac3-b1cf-16e4b7a11a59)
 
 ![Робот ROSik](/images/ROSik.png)
 
