@@ -5,15 +5,16 @@
 #include "esp_task_wdt.h"
 #include "driver/pcnt.h"
 #include <math.h>
+#include <TroykaIMU.h>
 
-/* ---------- Wi-Fi ---------- */
-constexpr char WIFI_SSID[] = "net";
-constexpr char WIFI_PASS[] = "password";
+// Настройки Wi-Fi
+constexpr char WIFI_SSID[] = "NOVA_B408";
+constexpr char WIFI_PASS[] = "table2442";
 
 /* ---------- Пины и параметры робота ---------- */
 // Двигатели (H-мосты)
-#define L_A 33
-#define L_B 32
+#define L_A 32
+#define L_B 33
 #define R_A 27
 #define R_B 26
 // Энкодеры (PCNT)
@@ -64,14 +65,25 @@ static float prevStartAngle = -1;
 volatile uint32_t stat_rx = 0;  // принятых 20-байтных пакетов от LDS
 volatile uint32_t stat_tx = 0;  // переданных полных сканов по WS
 
-/* ---------- Вспомогательные функции ---------- */
+/* ---------- Гироскоп ---------- */
+Gyroscope gyroscope;
+float axel_rotation[3] = {0, 0, 0};
+WiFiServer tcpServer(12345);  // TCP сервер для данных гироскопа
+WiFiClient tcpClient;
+
+/* ---------- WebSocket и HTTP сервер ---------- */
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+AsyncWebSocketClient *wsClient = nullptr;
+
+// Вспомогательные функции
 inline float decodeAngle(uint16_t raw) {
-  // Декодирует угол (двухбайтное значение) из формата LDS
   float a = (raw - 0xA000) / 64.0f;
   if (a < 0) a += 360.0f;
   else if (a >= 360) a -= 360.0f;
   return a;
 }
+
 bool readBytes(HardwareSerial &serial, uint8_t *dst, size_t n, uint32_t timeout = 300) {
   uint32_t t0 = millis();
   for (size_t i = 0; i < n; ++i) {
@@ -84,6 +96,7 @@ bool readBytes(HardwareSerial &serial, uint8_t *dst, size_t n, uint32_t timeout 
   }
   return true;
 }
+
 bool waitLidarHeader(HardwareSerial &serial) {
   uint8_t pos = 0;
   uint32_t t0 = millis();
@@ -99,6 +112,7 @@ bool waitLidarHeader(HardwareSerial &serial) {
     esp_task_wdt_reset();
   }
 }
+
 inline uint16_t crc16(uint16_t crc, uint8_t v) {
   crc ^= v;
   for (uint8_t i = 0; i < 8; ++i) {
@@ -107,23 +121,39 @@ inline uint16_t crc16(uint16_t crc, uint8_t v) {
   return crc;
 }
 
-/* ---------- Настройка WebSocket и HTTP ---------- */
-AsyncWebServer server(80);
-AsyncWebSocket ws("/ws");
-AsyncWebSocketClient *wsClient = nullptr;
+void pack6FloatsToBytes(float f1, float f2, float f3, float f4, float f5, float f6, uint8_t *bytes) {
+  float inputs[6] = { f1, f2, f3, f4, f5, f6 };
+
+  for (int i = 0; i < 6; ++i) {
+    union {
+      float f;
+      uint32_t i;
+    } converter;
+
+    converter.f = inputs[i];
+
+    bytes[i * 4 + 0] = (converter.i >> 0) & 0xFF;
+    bytes[i * 4 + 1] = (converter.i >> 8) & 0xFF;
+    bytes[i * 4 + 2] = (converter.i >> 16) & 0xFF;
+    bytes[i * 4 + 3] = (converter.i >> 24) & 0xFF;
+  }
+}
+
+void axel_rotate(float* arr) {
+    arr[0] = gyroscope.readRotationDegX();
+    arr[1] = gyroscope.readRotationDegY();
+    arr[2] = gyroscope.readRotationDegZ();
+}
 
 // Обработчик событий WebSocket
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
                AwsEventType type, void *arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_CONNECT) {
-    // Новый клиент подключился
     if (wsClient && wsClient->status() == WS_CONNECTED) {
-      // Закрываем предыдущего клиента, если был
       wsClient->close();
     }
     wsClient = client;
-    //wsClient->printf("[WS] Connected (id=%u)\n", client->id());
-    wsClient->client()->setNoDelay(true);  // отключаем алгоритм Нэгла для минимальной задержки
+    wsClient->client()->setNoDelay(true);
     Serial.printf("[WS] Client #%u connected\n", client->id());
   } else if (type == WS_EVT_DISCONNECT) {
     if (client == wsClient) {
@@ -131,17 +161,13 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
       Serial.printf("[WS] Client #%u disconnected\n", client->id());
     }
   } else if (type == WS_EVT_DATA) {
-    // NEW: входящее сообщение от клиента (ROS2), может содержать команду на движение
     AwsFrameInfo *info = (AwsFrameInfo *)arg;
     if (info->opcode == WS_BINARY && len == 4) {
-      // Ожидаем 4-байтовое бинарное сообщение: [int16_t left_mm_s, int16_t right_mm_s]
       int16_t left = data[0] | (data[1] << 8);
       int16_t right = data[2] | (data[3] << 8);
-      // Устанавливаем новые целевые скорости колес
       tgtL = (float)left;
       tgtR = (float)right;
-      lastCmdMs = millis();  // ← обновили «пинг»
-      // Включаем режим выравнивания, если |vL|≈|vR| и не ноль (робот едет прямо или крутится на месте)
+      lastCmdMs = millis();
       if (fabs(fabs(tgtL) - fabs(tgtR)) < 1.0f && fabs(tgtL) > 1.0f) {
         alignMode = true;
         alignSign = (tgtL * tgtR >= 0) ? 1.0f : -1.0f;
@@ -150,17 +176,14 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
       } else {
         alignMode = false;
       }
-      // Можно отправить подтверждение или лог (не обязательно)
       Serial.printf("[WS] Cmd: left=%d, right=%d\n", left, right);
     }
-    // Если нужно обработать текстовые сообщения или другие бинарные команды, добавить тут
   }
 }
 
 // Настройка HTTP-роутов
 void setupRoutes() {
   server.on("/state", HTTP_GET, [](AsyncWebServerRequest *request) {
-    // Формируем JSON с текущим состоянием робота
     char json[512];
     snprintf(json, sizeof(json),
              "{\"duty\":{\"L_A\":%u,\"L_B\":%u,\"R_A\":%u,\"R_B\":%u},"
@@ -177,8 +200,7 @@ void setupRoutes() {
   server.on("/setSpeed", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (request->hasParam("l")) tgtL = request->getParam("l")->value().toFloat();
     if (request->hasParam("r")) tgtR = request->getParam("r")->value().toFloat();
-    lastCmdMs = millis();  // ← обновили «пинг»
-    // Управление alignMode аналогично, как выше
+    lastCmdMs = millis();
     if (fabs(fabs(tgtL) - fabs(tgtR)) < 1.0f && fabs(tgtL) > 1.0f) {
       alignMode = true;
       alignSign = (tgtL * tgtR >= 0) ? 1.0f : -1.0f;
@@ -209,7 +231,6 @@ void setupRoutes() {
     odomX = odomY = odomTh = 0;
     request->send(200, "text/plain", "odom reset");
   });
-  // Тестовая главная страница (необязательно)
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "text/plain",
                   "Endpoints: /state /setSpeed /setCoeff /resetEnc /resetOdom");
@@ -219,7 +240,6 @@ void setupRoutes() {
 /* ---------- Управление моторами (PWM) ---------- */
 inline void setPWM(uint8_t pin, uint8_t value) {
   analogWrite(pin, value);
-  // Обновляем глобальные duty-переменные для мониторинга
   switch (pin) {
     case L_A: dutyLA = value; break;
     case L_B: dutyLB = value; break;
@@ -227,15 +247,12 @@ inline void setPWM(uint8_t pin, uint8_t value) {
     case R_B: dutyRB = value; break;
   }
 }
+
 inline void stopMotors() {
   setPWM(L_A, 0);
   setPWM(L_B, 0);
   setPWM(R_A, 0);
   setPWM(R_B, 0);
-  iTermR = 0;
-  prevErrorR = 0;
-  iTermL = 0;
-  prevErrorL = 0;
 }
 
 /* ---------- Инициализация счетчиков PCNT ---------- */
@@ -257,6 +274,7 @@ void pcntInit(pcnt_unit_t unit, gpio_num_t pulse_pin, gpio_num_t ctrl_pin) {
   pcnt_counter_clear(unit);
   pcnt_counter_resume(unit);
 }
+
 inline int16_t readEncoder(pcnt_unit_t unit) {
   int16_t count = 0;
   pcnt_get_counter_value(unit, &count);
@@ -276,53 +294,51 @@ void updatePID() {
   if (dt < 0.001f) dt = 0.001f;
   prevMillis = now;
 
-  // Сброс интегральной части при изменении целевой скорости или переходе через 0
-  if (fabs(tgtL) < 1.0f) {
+  if (tgtL != lastTgtL || fabs(tgtL) < 1.0f) {
     iTermL = 0;
     prevErrorL = 0;
   }
-  if (fabs(tgtR) < 1.0f) {
+  if (tgtR != lastTgtR || fabs(tgtR) < 1.0f) {
     iTermR = 0;
     prevErrorR = 0;
   }
   lastTgtL = tgtL;
   lastTgtR = tgtR;
 
-  // Выравнивание (P-регулятор) – корректирует цель при езде строго прямо или повороте на месте
   float corr = 0.0f;
   if (alignMode) {
     int32_t dL = encTotL - alignRefL;
     int32_t dR = encTotR - alignRefR;
-    float diff_mm = (float)(dL - alignSign * dR) * MM_PER_TICK;  // разница пройденного пути (мм)
-    corr = kAlign * diff_mm;                                     // мм/с коррекция
+    float diff_mm = (float)(dL - alignSign * dR) * MM_PER_TICK;
+    corr = kAlign * diff_mm;
   }
   float tgtCorrL = tgtL - corr;
   float tgtCorrR = tgtR + alignSign * corr;
 
-  // PID для левого и правого колеса
   float errorL = tgtCorrL - speedL;
   float errorR = tgtCorrR - speedR;
   iTermL += errorL * dt;
   iTermR += errorR * dt;
-  // ограничиваем накопление интегральной ошибки
+  
   const float I_LIMIT = 300.0f;
   if (iTermL > I_LIMIT) iTermL = I_LIMIT;
   if (iTermL < -I_LIMIT) iTermL = -I_LIMIT;
   if (iTermR > I_LIMIT) iTermR = I_LIMIT;
   if (iTermR < -I_LIMIT) iTermR = -I_LIMIT;
+  
   float dTermL = (errorL - prevErrorL) / dt;
   float dTermR = (errorR - prevErrorR) / dt;
   prevErrorL = errorL;
   prevErrorR = errorR;
-  // Управляющее воздействие
+  
   float outputL = kp * errorL + ki * iTermL + kd * dTermL + kff * tgtCorrL;
   float outputR = kp * errorR + ki * iTermR + kd * dTermR + kff * tgtCorrR;
-  // Ограничиваем PWM
+  
   if (outputL > 255) outputL = 255;
   if (outputL < -255) outputL = -255;
   if (outputR > 255) outputR = 255;
   if (outputR < -255) outputR = -255;
-  // Задаём PWM на моторах (A-вперёд, B-назад)
+  
   uint8_t pwmLA, pwmLB, pwmRA, pwmRB;
   if (outputL >= 0) {
     pwmLA = (uint8_t)outputL;
@@ -352,13 +368,9 @@ void lidarTask(void *param) {
   while (true) {
     esp_task_wdt_reset();
     vTaskDelay(1);
-    if (!waitLidarHeader(Serial2)) {
-      continue;
-    }
-    if (!readBytes(Serial2, body, BODY_LEN)) {
-      continue;
-    }
-    // Распарсить порцию точек лидара
+    if (!waitLidarHeader(Serial2)) continue;
+    if (!readBytes(Serial2, body, BODY_LEN)) continue;
+    
     float startDeg = decodeAngle(body[2] | (body[3] << 8));
     uint8_t offset = 4;
     uint16_t dist[8];
@@ -370,11 +382,8 @@ void lidarTask(void *param) {
     }
     float endDeg = decodeAngle(body[offset] | (body[offset + 1] << 8));
     if (endDeg < startDeg) endDeg += 360.0f;
-    if (endDeg - startDeg > MAX_SPREAD_DEG) {
-      // Пропускаем пакет, если слишком большой разрыв (ошибка)
-      continue;
-    }
-    // Упаковываем 20 байт в общий буфер скана
+    if (endDeg - startDeg > MAX_SPREAD_DEG) continue;
+    
     uint16_t s = (uint16_t)(startDeg * 100 + 0.5f);
     uint16_t e = (uint16_t)(endDeg * 100 + 0.5f);
     *wr++ = s & 0xFF;
@@ -388,28 +397,27 @@ void lidarTask(void *param) {
     }
     frameCount++;
     stat_rx++;
+    
     if (frameCount >= MAX_FRAMES) {
       frameCount = 0;
       wr = scanBuf;
-      prevStartAngle = -1;  // сброс для корректного «перескока» угла
-      continue;             // переходим к следующему пакету
+      prevStartAngle = -1;
+      continue;
     }
-    // Проверяем перескок через 0° (начало нового круга)
+    
     if (prevStartAngle >= 0.0f && startDeg < prevStartAngle && frameCount >= 30) {
       size_t scanSize = frameCount * FRAME_LEN;
-      // Вычисляем CRC для всего скана
       uint16_t crc = 0xFFFF;
       for (size_t i = 0; i < scanSize; ++i) {
         crc = crc16(crc, scanBuf[i]);
       }
       scanBuf[scanSize] = crc & 0xFF;
       scanBuf[scanSize + 1] = crc >> 8;
-      // Отправляем по WebSocket, если клиент подключен
+      
       if (wsClient && wsClient->canSend()) {
         wsClient->binary(scanBuf, scanSize + 2);
         stat_tx++;
       }
-      // Сбрасываем буфер для следующего оборота
       wr = scanBuf;
       frameCount = 0;
     }
@@ -420,7 +428,11 @@ void lidarTask(void *param) {
 /* ---------- SETUP ---------- */
 void setup() {
   Serial.begin(115200);
-  Serial.println("=== ESP32 Lidar+Motor Bridge ===");
+  Serial.println("=== ESP32 Lidar+Motor+IMU Bridge ===");
+  
+  // Инициализация гироскопа
+  gyroscope.begin();
+  
   // Wi-Fi подключение
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -430,28 +442,61 @@ void setup() {
     Serial.print('.');
   }
   Serial.printf("\nWiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+  
   // Настройка GPIO
   pinMode(L_A, OUTPUT);
   pinMode(L_B, OUTPUT);
   pinMode(R_A, OUTPUT);
   pinMode(R_B, OUTPUT);
   stopMotors();
+  
   // PCNT для энкодеров
   pcntInit(PCNT_UNIT_0, (gpio_num_t)ENC_R_A, (gpio_num_t)ENC_R_B);
   pcntInit(PCNT_UNIT_1, (gpio_num_t)ENC_L_A, (gpio_num_t)ENC_L_B);
+  
   // Запуск веб-сервера и WebSocket
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
   setupRoutes();
   server.begin();
+  
+  // Запуск TCP сервера для данных гироскопа
+  tcpServer.begin();
+  
   // Запуск задачи лидара на ядре 0
   xTaskCreatePinnedToCore(lidarTask, "LidarTask", 4096, nullptr, 2, nullptr, 0);
 }
 
 /* ---------- LOOP ---------- */
 void loop() {
-  static uint32_t t10 = 0, t20 = 0, t2000 = 0;
+  static uint32_t t10 = 0, t20 = 0, t2000 = 0, tGyro = 0;
+  
+  // Подключение TCP клиента для гироскопа
+  if (!tcpClient || !tcpClient.connected()) {
+    tcpClient = tcpServer.available();
+  }
+  
+  // Отправка данных гироскопа каждые 10 мс
+  if (tcpClient && tcpClient.connected() && millis() - tGyro >= 10) {
+    tGyro = millis();
+    axel_rotate(axel_rotation);
+    uint8_t buffer[24];
+    pack6FloatsToBytes(0.00, 0.00, 0.00, axel_rotation[0]/57.3, axel_rotation[1]/57.3, axel_rotation[2]/57.3, buffer);
+    tcpClient.write(buffer, sizeof(buffer));
+  }
+  
   uint32_t now = millis();
+  
+  /* --- safety timeout: если 3000 ms нет команд, стоп --- */
+  if (now - lastCmdMs > 3000) {
+    if (tgtL != 0 || tgtR != 0) {
+      tgtL = tgtR = 0;
+      alignMode = false;
+      stopMotors();
+      Serial.println("[SAFE] cmd timeout → STOP");
+    }
+  }
+  
   // Каждые 10 мс: считываем энкодеры, обновляем одометрию
   if (now - t10 >= 10) {
     t10 = now;
@@ -459,20 +504,21 @@ void loop() {
     int16_t dL = readEncoder(PCNT_UNIT_1);
     encTotR += dR;
     encTotL += dL;
-    // Расстояние, пройденное каждым колесом за 10 мс (в метрах)
+    
     float sR = dR * MM_PER_TICK / 1000.0f;
     float sL = dL * MM_PER_TICK / 1000.0f;
-    // Обновляем одометрические координаты (в глобальной системе odom)
+    
     float ds = 0.5f * (sR + sL);
     float dth = (sR - sL) / BASE_L;
     float midTh = odomTh + 0.5f * dth;
     odomX += ds * cosf(midTh);
     odomY += ds * sinf(midTh);
     odomTh += dth;
-    // Нормализуем угол odomTh в [-pi, pi]
+    
     if (odomTh > M_PI) odomTh -= 2 * M_PI;
     if (odomTh < -M_PI) odomTh += 2 * M_PI;
   }
+  
   // Каждые 20 мс: вычисляем текущие скорости колес (мм/с)
   if (now - t20 >= 20) {
     float dt = (now - t20) * 0.001f;
@@ -482,15 +528,18 @@ void loop() {
     prevEncL = encTotL;
     prevEncR = encTotR;
   }
+  
   // Каждые 20 мс: обновляем PID-регулятор и ШИМ моторов
   static uint32_t tPID = 0;
   if (now - tPID >= 20) {
     tPID = now;
     updatePID();
   }
-  // Обслуживание клиентов WebSocket (освобождение памяти для отключившихся)
+  
+  // Обслуживание клиентов WebSocket
   ws.cleanupClients();
-  // Каждые 2 с: выводим IP (для мониторинга, не обязательно)
+  
+  // Каждые 2 с: выводим IP (для мониторинга)
   if (now - t2000 >= 2000) {
     t2000 = now;
     Serial.println(WiFi.localIP());
